@@ -73,9 +73,11 @@ flat video search, same as before.
 
 ## Customizing the ustaz list
 
-Edit `ustaz_list.txt` — one name per line. `talabulilm -u` fuzzy-lists these
-names via `fzf`; picking one runs the same search flow as free-text search,
-just pre-filled with that name.
+The first time you run talabulilm, it copies a default list to
+`${XDG_DATA_HOME:-$HOME/.local/share}/talabulilm/ustaz_list.txt` — edit
+that copy (one name per line; `#` comments and blank lines are ignored).
+`talabulilm -u` fuzzy-lists these names via `fzf`; picking one runs the
+same browse flow as free-text search, just pre-filled with that name.
 
 ## History
 

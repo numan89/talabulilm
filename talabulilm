@@ -20,7 +20,7 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/talabulilm"
 HISTORY_FILE="$STATE_DIR/history.tsv"
 CACHE_DIR="$DATA_DIR/cache"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-USTAZ_LIST="$SCRIPT_DIR/ustaz_list.txt"
+PKG_DATA_DIR="/usr/share/talabulilm" # where a system package installs its default list
 
 SEARCH_COUNT=25 # results fetched in flat/fallback search mode
 CHANNEL_LIMIT=5 # channels shown when browsing by groups
@@ -87,6 +87,32 @@ EOF
 mkdirs() {
 	mkdir -p "$DATA_DIR" "$STATE_DIR" "$CACHE_DIR"
 	[ -f "$HISTORY_FILE" ] || : >"$HISTORY_FILE"
+	seed_ustaz_list
+}
+
+# Copy a personal, editable ustaz list into DATA_DIR the first time we run,
+# seeded from whichever bundled default is found (dev checkout or package).
+seed_ustaz_list() {
+	[ -f "$DATA_DIR/ustaz_list.txt" ] && return 0
+	local src=""
+	if [ -f "$SCRIPT_DIR/ustaz_list.txt" ]; then
+		src="$SCRIPT_DIR/ustaz_list.txt"
+	elif [ -f "$PKG_DATA_DIR/ustaz_list.txt" ]; then
+		src="$PKG_DATA_DIR/ustaz_list.txt"
+	fi
+	[ -n "$src" ] && cp "$src" "$DATA_DIR/ustaz_list.txt"
+	return 0
+}
+
+# Find the ustaz list to use: an explicit override, the user's own editable
+# copy, a dev checkout sitting next to the script, or a package's default.
+resolve_ustaz_list() {
+	local c
+	for c in "${TALABULILM_USTAZ_LIST:-}" "$DATA_DIR/ustaz_list.txt" \
+		"$SCRIPT_DIR/ustaz_list.txt" "$PKG_DATA_DIR/ustaz_list.txt"; do
+		[ -n "$c" ] && [ -f "$c" ] && { printf '%s' "$c"; return 0; }
+	done
+	return 1
 }
 
 # Stable cache key for a query: normalized text -> checksum_length.
@@ -316,8 +342,9 @@ pick_group() {
 }
 
 pick_from_ustaz_list() {
-	[ -f "$USTAZ_LIST" ] || die "Ustaz list not found at $USTAZ_LIST"
-	grep -v '^\s*#' "$USTAZ_LIST" | grep -v '^\s*$' | fzf \
+	local list_file
+	list_file="$(resolve_ustaz_list)" || die "Ustaz list not found (set TALABULILM_USTAZ_LIST or reinstall talabulilm)."
+	grep -v '^\s*#' "$list_file" | grep -v '^\s*$' | fzf \
 		--prompt='ustaz> ' --reverse --height=90% \
 		--header='enter: pick an ustaz | esc/ctrl-c: quit'
 }
