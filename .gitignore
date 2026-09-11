@@ -1,0 +1,10 @@
+# Downloaded lectures, if downloaded into the repo directory
+*.mp4
+*.mkv
+*.webm
+*.m4a
+*.mp3
+
+# Editor/OS cruft
+.DS_Store
+*.swp

@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+#
+# talabulilm - watch Ceramah Ustaz (Islamic lectures) from the terminal
+# Same idea as ani-cli, but for ceramah instead of anime: search, pick
+# with fzf, stream straight into mpv via yt-dlp.
+#
+# Browsing flow for a free-text query (e.g. an ustaz's name):
+#   1. Find matching YouTube channels.
+#   2. For each channel, list its playlists *and* a bucket of videos that
+#      aren't in any playlist ("Other videos").
+#   3. User picks a group (channel+playlist), then picks a video in it.
+
+set -euo pipefail
+
+VERSION="0.2.0"
+PROGRAM="talabulilm"
+
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/talabulilm"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/talabulilm"
+HISTORY_FILE="$STATE_DIR/history.tsv"
+CACHE_DIR="$DATA_DIR/cache"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+USTAZ_LIST="$SCRIPT_DIR/ustaz_list.txt"
+
+SEARCH_COUNT=25 # results fetched in flat/fallback search mode
+CHANNEL_LIMIT=5 # channels shown when browsing by groups
+PLAYLIST_LIMIT=15 # playlists fetched per channel
+UPLOADS_LIMIT=60 # uploads fetched per channel
+PARALLEL_JOBS=5 # concurrent yt-dlp calls when fetching playlists
+CACHE_TTL_SECONDS=86400 # how long a cached group listing stays fresh (24h)
+
+QUALITY="best"
+AUDIO_ONLY=0
+DOWNLOAD=0
+FLAT_MODE=0
+REFRESH=0
+DOWNLOAD_DIR="${TALABULILM_DOWNLOAD_DIR:-$PWD}"
+
+err() { printf 'talabulilm: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+need_bin() {
+	command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed."
+}
+
+check_deps() {
+	need_bin fzf
+	need_bin yt-dlp
+	if [ "$DOWNLOAD" -eq 0 ]; then
+		need_bin mpv
+	fi
+}
+
+usage() {
+	cat <<EOF
+$PROGRAM $VERSION - watch Ceramah Ustaz from the terminal
+
+Usage:
+  $PROGRAM [options] [search terms]
+
+Typing a name/topic browses in two steps: pick a channel/playlist group,
+then pick a video inside it. Loose uploads that aren't in any playlist
+show up under an "Other videos" group per channel. Group listings are
+cached for $((CACHE_TTL_SECONDS / 3600))h so repeat searches are instant; use -r to force a refresh.
+
+Options:
+  -u, --ustaz            Pick from a curated list of known ustaz first
+  -c, --continue         Continue from watch history
+  -f, --flat             Skip channel/playlist grouping, just search videos
+  -r, --refresh          Ignore cached group listing, re-fetch from YouTube
+  -d, --download         Download instead of streaming
+  -o, --output <dir>     Download directory (default: current directory)
+  -q, --quality <res>    Video quality: best|1080|720|480|360|worst (default: best)
+  -a, --audio-only       Audio-only (good for long ceramah, saves bandwidth)
+  -n, --results <num>    Results fetched in flat search mode (default: $SEARCH_COUNT)
+  -v, --version          Show version
+  -h, --help             Show this help
+
+Examples:
+  $PROGRAM bakhiet
+  $PROGRAM -u
+  $PROGRAM -f -a "sabar dalam ujian"
+  $PROGRAM -d -q 720 "adab menuntut ilmu"
+EOF
+}
+
+mkdirs() {
+	mkdir -p "$DATA_DIR" "$STATE_DIR" "$CACHE_DIR"
+	[ -f "$HISTORY_FILE" ] || : >"$HISTORY_FILE"
+}
+
+# Stable cache key for a query: normalized text -> checksum_length.
+cache_key_for() {
+	local norm
+	norm="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ')"
+	norm="${norm# }"
+	norm="${norm% }"
+	printf '%s' "$norm" | cksum | awk '{print $1"_"$2}'
+}
+
+# Percent-encode a string for use in a URL query, UTF-8 safe.
+urlencode() {
+	local s="$1" out="" c i hex j
+	for ((i = 0; i < ${#s}; i++)); do
+		c="${s:i:1}"
+		case "$c" in
+		[a-zA-Z0-9.~_-]) out+="$c" ;;
+		' ') out+='+' ;;
+		*)
+			hex="$(printf '%s' "$c" | od -An -tx1 | tr -d ' \n')"
+			for ((j = 0; j < ${#hex}; j += 2)); do
+				out+="%${hex:j:2}"
+			done
+			;;
+		esac
+	done
+	printf '%s' "$out"
+}
+
+# yt-dlp format string honoring quality + audio-only flags
+format_string() {
+	if [ "$AUDIO_ONLY" -eq 1 ]; then
+		printf 'bestaudio/best'
+		return
+	fi
+	case "$QUALITY" in
+	best) printf 'bestvideo*+bestaudio/best' ;;
+	worst) printf 'worstvideo*+worstaudio/worst' ;;
+	*) printf 'bestvideo*[height<=%s]+bestaudio/best[height<=%s]' "$QUALITY" "$QUALITY" ;;
+	esac
+}
+
+# Search YouTube for ceramah matching the given free-text query.
+# Prints tab-separated: id \t title \t channel \t duration
+search_videos() {
+	local query="$1"
+	yt-dlp \
+		"ytsearch${SEARCH_COUNT}:Ceramah Ustaz ${query}" \
+		--flat-playlist --no-warnings \
+		--print $'%(id)s\t%(title)s\t%(uploader)s\t%(duration_string)s' 2>/dev/null
+}
+
+# Find YouTube channels matching the query, best-followed first.
+# Prints tab-separated: channel_id \t channel_title
+search_channels() {
+	local query="$1" q
+	q="$(urlencode "Ceramah Ustaz ${query}")"
+	yt-dlp "https://www.youtube.com/results?search_query=${q}&sp=EgIQAg%253D%253D" \
+		--flat-playlist --no-warnings --playlist-end $((CHANNEL_LIMIT * 3)) \
+		--print $'%(id)s\t%(title)s\t%(channel_follower_count)s' 2>/dev/null |
+		awk -F'\t' 'BEGIN{OFS="\t"} { if ($3=="" || $3=="NA") $3=0; print }' |
+		sort -t $'\t' -k3,3 -nr |
+		head -n "$CHANNEL_LIMIT" |
+		cut -f1,2
+}
+
+# Fetch every playlist's video list for one channel, in parallel.
+# Reads $workdir/ch_$idx.playlists.tsv, writes ch_${idx}_pl_${n}.tsv per row.
+fetch_playlist_videos_parallel() {
+	local idx="$1" workdir="$2"
+	local plist_file="$workdir/ch_${idx}.playlists.tsv"
+	[ -s "$plist_file" ] || return 0
+
+	local pidx=0 pid ptitle
+	local -a pids=()
+	while IFS=$'\t' read -r pid ptitle; do
+		pidx=$((pidx + 1))
+		(
+			yt-dlp "https://www.youtube.com/playlist?list=${pid}" \
+				--flat-playlist --no-warnings --playlist-end "$UPLOADS_LIMIT" \
+				--print $'%(id)s\t%(title)s\t%(uploader)s\t%(duration_string)s' \
+				>"$workdir/ch_${idx}_pl_${pidx}.tsv" 2>/dev/null
+		) &
+		pids+=("$!")
+		if [ "${#pids[@]}" -ge "$PARALLEL_JOBS" ]; then
+			wait "${pids[@]}" || true
+			pids=()
+		fi
+	done <"$plist_file"
+	[ "${#pids[@]}" -gt 0 ] && { wait "${pids[@]}" || true; }
+	return 0
+}
+
+# Build the two-level group index for a query: channels -> (playlists + a
+# loose "other videos" bucket). Prints the path of the resulting groups.tsv
+# (columns: video_list_file \t colored_label) on success, exits 1 on failure.
+build_groups() {
+	local query="$1"
+	local key cache_path
+	key="$(cache_key_for "$query")"
+	cache_path="$CACHE_DIR/$key"
+
+	if [ "$REFRESH" -eq 0 ] && [ -s "$cache_path/groups.tsv" ]; then
+		local mtime now age
+		mtime="$(stat -c %Y "$cache_path/groups.tsv" 2>/dev/null || echo 0)"
+		now="$(date +%s)"
+		age=$((now - mtime))
+		if [ "$age" -lt "$CACHE_TTL_SECONDS" ]; then
+			err "Using cached listing for '${query}' (${age}s old; use -r to refresh)."
+			printf '%s' "$cache_path/groups.tsv"
+			return 0
+		fi
+	fi
+
+	rm -rf "$cache_path"
+	mkdir -p "$cache_path"
+	local workdir="$cache_path"
+
+	local channels_file="$workdir/channels.tsv"
+	search_channels "$query" >"$channels_file"
+	if [ ! -s "$channels_file" ]; then
+		rm -rf "$cache_path"
+		return 1
+	fi
+
+	local groups_file="$workdir/groups.tsv"
+	: >"$groups_file"
+
+	local idx=0 cid ctitle
+	while IFS=$'\t' read -r cid ctitle; do
+		idx=$((idx + 1))
+		err "  -> ${ctitle}: fetching uploads & playlists..."
+
+		yt-dlp "https://www.youtube.com/channel/${cid}/videos" \
+			--flat-playlist --no-warnings --playlist-end "$UPLOADS_LIMIT" \
+			--print $'%(id)s\t%(title)s\t%(duration_string)s' 2>/dev/null |
+			awk -F'\t' -v ch="$ctitle" 'BEGIN{OFS="\t"}{print $1,$2,ch,$3}' \
+				>"$workdir/ch_${idx}.uploads.tsv" || true
+
+		yt-dlp "https://www.youtube.com/channel/${cid}/playlists" \
+			--flat-playlist --no-warnings --playlist-end "$PLAYLIST_LIMIT" \
+			--print $'%(id)s\t%(title)s' >"$workdir/ch_${idx}.playlists.tsv" 2>/dev/null || true
+
+		fetch_playlist_videos_parallel "$idx" "$workdir"
+
+		cat "$workdir/ch_${idx}"_pl_*.tsv 2>/dev/null | cut -f1 | sort -u \
+			>"$workdir/ch_${idx}.playlisted_ids" || : >"$workdir/ch_${idx}.playlisted_ids"
+
+		awk -F'\t' 'NR==FNR{seen[$0]=1;next} !($1 in seen)' \
+			"$workdir/ch_${idx}.playlisted_ids" "$workdir/ch_${idx}.uploads.tsv" \
+			>"$workdir/ch_${idx}.loose.tsv" 2>/dev/null || : >"$workdir/ch_${idx}.loose.tsv"
+
+		local pidx=0 pid ptitle
+		if [ -s "$workdir/ch_${idx}.playlists.tsv" ]; then
+			while IFS=$'\t' read -r pid ptitle; do
+				pidx=$((pidx + 1))
+				local pfile="$workdir/ch_${idx}_pl_${pidx}.tsv" count=0
+				[ -f "$pfile" ] && count="$(wc -l <"$pfile")"
+				[ "$count" -gt 0 ] || continue
+				printf '%s\t\033[1;36m%s\033[0m \033[2m>\033[0m 📁 %s  \033[2m(%s)\033[0m\n' \
+					"$pfile" "$ctitle" "$ptitle" "$count" >>"$groups_file"
+			done <"$workdir/ch_${idx}.playlists.tsv"
+		fi
+
+		local loose_count=0
+		[ -f "$workdir/ch_${idx}.loose.tsv" ] && loose_count="$(wc -l <"$workdir/ch_${idx}.loose.tsv")"
+		if [ "$loose_count" -gt 0 ]; then
+			printf '%s\t\033[1;36m%s\033[0m \033[2m>\033[0m 🎬 %s  \033[2m(%s)\033[0m\n' \
+				"$workdir/ch_${idx}.loose.tsv" "$ctitle" "Other videos (no playlist)" "$loose_count" \
+				>>"$groups_file"
+		fi
+	done <"$channels_file"
+
+	if [ ! -s "$groups_file" ]; then
+		rm -rf "$cache_path"
+		return 1
+	fi
+	printf '%s' "$groups_file"
+}
+
+# Pretty, aligned single-column display for tab-separated video rows
+# (id, title, channel, duration) read from stdin. Emits id \t display.
+format_video_display() {
+	awk -F'\t' '
+		function trunc(s, n) { return (length(s) > n) ? substr(s, 1, n - 3) "..." : s }
+		BEGIN { OFS = "\t" }
+		{
+			title = trunc($2, 72)
+			printf "%s\t\033[1m%-72s\033[0m  \033[36m%8s\033[0m  \033[2m%s\033[0m\n", $1, title, $4, $3
+		}
+	'
+}
+
+# Present tab-separated video rows in fzf, return the chosen raw line.
+#
+# If $2 (back_label) is given, Esc is captured separately from Ctrl-C so
+# the caller can tell "go back" (Esc) apart from "quit" (Ctrl-C): output
+# is then two lines, the pressed key ("esc" or empty) then the selected
+# row (empty if none). Without $2, output is just the selected row, same
+# as before (Esc and Ctrl-C both mean quit).
+pick_row() {
+	local prompt="$1" back_label="${2:-}"
+	if [ -n "$back_label" ]; then
+		format_video_display | fzf --ansi --prompt="$prompt> " \
+			--delimiter=$'\t' --with-nth=2 \
+			--reverse --height=90% \
+			--expect=esc \
+			--header=$'🎬 Select a lecture\nenter: play | esc: '"$back_label"$' | ctrl-c: quit'
+	else
+		format_video_display | fzf --ansi --prompt="$prompt> " \
+			--delimiter=$'\t' --with-nth=2 \
+			--reverse --height=90% \
+			--header=$'🎬 Select a lecture\nenter: play | esc/ctrl-c: quit'
+	fi
+}
+
+# Present group rows (file \t colored label) in fzf, return chosen file path.
+pick_group() {
+	local groups_file="$1"
+	fzf --ansi --prompt='group> ' --delimiter=$'\t' --with-nth=2 \
+		--reverse --height=90% \
+		--header=$'📁 playlist   🎬 videos with no playlist\nenter: open | esc/ctrl-c: quit' \
+		--preview 'cut -f2 {1} | nl -ba -s". " | sed "s/^/  /"' \
+		--preview-window=right:55%:wrap \
+		<"$groups_file" | cut -f1
+}
+
+pick_from_ustaz_list() {
+	[ -f "$USTAZ_LIST" ] || die "Ustaz list not found at $USTAZ_LIST"
+	grep -v '^\s*#' "$USTAZ_LIST" | grep -v '^\s*$' | fzf \
+		--prompt='ustaz> ' --reverse --height=90% \
+		--header='enter: pick an ustaz | esc/ctrl-c: quit'
+}
+
+play_url() {
+	local url="$1" title="$2"
+	local fmt
+	fmt="$(format_string)"
+	printf 'Now playing: %s\n' "$title"
+	mpv --force-window=yes --ytdl-format="$fmt" --title="$title" "$url"
+}
+
+download_url() {
+	local url="$1"
+	local fmt
+	fmt="$(format_string)"
+	mkdir -p "$DOWNLOAD_DIR"
+	yt-dlp -f "$fmt" -o "$DOWNLOAD_DIR/%(uploader)s - %(title)s.%(ext)s" "$url"
+}
+
+log_history() {
+	local id="$1" title="$2" channel="$3"
+	local tmp
+	tmp="$(mktemp)"
+	{
+		printf '%s\t%s\t%s\t%s\n' "$id" "$title" "$channel" "$(date -Iseconds)"
+		grep -v "^${id}	" "$HISTORY_FILE" 2>/dev/null || true
+	} >"$tmp"
+	mv "$tmp" "$HISTORY_FILE"
+}
+
+pick_from_history() {
+	[ -s "$HISTORY_FILE" ] || die "No watch history yet."
+	fzf --prompt='history> ' \
+		--with-nth=2,3,4 --delimiter=$'\t' \
+		--reverse --height=90% \
+		--header='enter: rewatch | esc/ctrl-c: quit' <"$HISTORY_FILE"
+}
+
+handle_row() {
+	local row="$1"
+	[ -n "$row" ] || exit 0
+
+	local id title channel
+	id="$(cut -f1 <<<"$row")"
+	title="$(cut -f2 <<<"$row")"
+	channel="$(cut -f3 <<<"$row")"
+	local url="https://www.youtube.com/watch?v=${id}"
+
+	log_history "$id" "$title" "$channel"
+
+	if [ "$DOWNLOAD" -eq 1 ]; then
+		download_url "$url"
+	else
+		play_url "$url" "$title"
+	fi
+}
+
+# Two-step browse: channel/playlist group, then video. Falls back to a
+# plain flat search if no channels match, or if --flat was requested.
+browse() {
+	local query="$1"
+
+	if [ "$FLAT_MODE" -eq 0 ]; then
+		err "Looking up channels for '${query}'..."
+		local groups_file=""
+		if groups_file="$(build_groups "$query")" && [ -n "$groups_file" ]; then
+			local chosen_file output key row
+			while true; do
+				chosen_file="$(pick_group "$groups_file")"
+				[ -n "$chosen_file" ] || exit 0
+
+				output="$(pick_row "video" "back to groups" <"$chosen_file")"
+				key="$(sed -n '1p' <<<"$output")"
+				row="$(sed -n '2p' <<<"$output")"
+
+				[ "$key" = "esc" ] && continue
+				[ -n "$row" ] || exit 0
+				handle_row "$row"
+				return
+			done
+		fi
+		err "No channels found for '${query}', falling back to a plain search."
+	fi
+
+	local results row
+	results="$(search_videos "$query")"
+	[ -n "$results" ] || die "No results found for '$query'."
+	row="$(pick_row "video" <<<"$results")"
+	handle_row "$row"
+}
+
+main() {
+	local mode="search"
+	local query=""
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-u | --ustaz) mode="ustaz" ;;
+		-c | --continue) mode="history" ;;
+		-f | --flat) FLAT_MODE=1 ;;
+		-r | --refresh) REFRESH=1 ;;
+		-d | --download) DOWNLOAD=1 ;;
+		-o | --output)
+			shift
+			DOWNLOAD_DIR="${1:?--output requires a directory}"
+			;;
+		-q | --quality)
+			shift
+			QUALITY="${1:?--quality requires a value}"
+			;;
+		-a | --audio-only) AUDIO_ONLY=1 ;;
+		-n | --results)
+			shift
+			SEARCH_COUNT="${1:?--results requires a number}"
+			;;
+		-v | --version)
+			printf '%s %s\n' "$PROGRAM" "$VERSION"
+			exit 0
+			;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		--)
+			shift
+			query="$*"
+			break
+			;;
+		-*)
+			die "Unknown option: $1 (see --help)"
+			;;
+		*)
+			query="$query $1"
+			;;
+		esac
+		shift
+	done
+	query="$(echo "$query" | xargs || true)"
+
+	check_deps
+	mkdirs
+
+	case "$mode" in
+	ustaz)
+		local ustaz
+		ustaz="$(pick_from_ustaz_list)"
+		[ -n "$ustaz" ] || exit 0
+		browse "$ustaz"
+		;;
+	history)
+		local row
+		row="$(pick_from_history)"
+		handle_row "$row"
+		;;
+	search)
+		[ -n "$query" ] || {
+			usage
+			exit 1
+		}
+		browse "$query"
+		;;
+	esac
+}
+
+main "$@"
