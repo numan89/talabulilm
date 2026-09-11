@@ -1,130 +1,140 @@
 # talabulilm
 
-A terminal tool for watching **Ceramah Ustaz** (Islamic lectures) — same
-workflow as [ani-cli](https://github.com/pystardust/ani-cli), but instead of
-anime it searches, lists, and streams ceramah videos.
+A full-screen terminal app for watching **Ceramah Ustaz** (Islamic
+lectures) — same idea as [ani-cli](https://github.com/pystardust/ani-cli),
+but instead of anime it browses, groups, and streams ceramah videos, with
+its own persistent UI and keybindings (like
+[`cekhalal`](https://github.com/numan89/cekhalal), my other terminal
+tool — same look, same feel).
 
-Type a name or topic and it browses in two steps, like a mini video library:
+Type a name or topic and it browses in two steps, like a mini video
+library:
 
-1. **Pick a group** — talabulilm finds matching YouTube channels, and for
-   each one lists its `PL` playlists plus an `OTHER` bucket for uploads
-   the channel never put in a playlist. A preview pane shows what's
-   inside before you commit.
-2. **Pick a video** — from inside the chosen channel/playlist. Press
-   `Esc` here to go back to the group list (`Ctrl-C` quits entirely).
+1. **Groups** — talabulilm finds matching YouTube channels, and for each
+   one lists its `PL` playlists plus an `OTHER` bucket for uploads the
+   channel never put in a playlist. Groups stream in live as each channel
+   finishes loading, and a preview pane shows what's inside before you
+   commit — no separate "open" step.
+2. **Videos** — from inside the chosen channel/playlist. `Esc` goes back
+   to the group list.
 
-Both screens render as a rounded, bordered `fzf` panel with a branded
-label, matching the look of my other terminal tools.
-
-Then it streams straight into `mpv` via `yt-dlp` — no browser, no ads, no
+Then it plays straight into `mpv` via `yt-dlp` — no browser, no ads, no
 downloads needed (unless you want one).
 
 ## Dependencies
 
-- [`fzf`](https://github.com/junegunn/fzf)
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)
-- [`mpv`](https://mpv.io/) (not needed if you only ever use `--download`)
+- [`mpv`](https://mpv.io/)
 
 Install on Arch:
 
 ```sh
-sudo pacman -S fzf yt-dlp mpv
+sudo pacman -S yt-dlp mpv
 ```
 
 ## Install
 
+**Arch Linux (AUR):** `yay -S talabulilm` or `paru -S talabulilm` (or
+manually: `git clone https://aur.archlinux.org/talabulilm.git && cd talabulilm && makepkg -si`)
+
+**From source:**
+
 ```sh
 git clone https://github.com/numan89/talabulilm.git
 cd talabulilm
-chmod +x talabulilm
-sudo ln -s "$PWD/talabulilm" /usr/local/bin/talabulilm
+cargo build --release
+./target/release/talabulilm
 ```
-
-Or just run it in place: `./talabulilm`.
 
 ## Usage
 
 ```sh
-talabulilm [options] [search terms]
+talabulilm            # launch with an empty search box
+talabulilm bakhiet    # launch and immediately search
 ```
 
-| Option | Description |
-|---|---|
-| `-u, --ustaz` | Pick from a curated list of well-known ustaz first, then browse their channel(s) |
-| `-c, --continue` | Rewatch something from your local history |
-| `-f, --flat` | Skip channel/playlist grouping — go straight to a plain video search |
-| `-d, --download` | Download instead of streaming |
-| `-o, --output <dir>` | Download directory (default: current directory) |
-| `-q, --quality <res>` | `best` \| `1080` \| `720` \| `480` \| `360` \| `worst` (default: `best`) |
-| `-a, --audio-only` | Stream/download audio only |
-| `-n, --results <num>` | Results fetched in flat search mode (default: 25) |
-| `-v, --version` | Show version |
-| `-h, --help` | Show help |
+### Keybindings
 
-### Examples
+| Keys | Where | Does |
+|---|---|---|
+| Type, `Enter` | Search | Run a search |
+| `Ctrl+U` | anywhere | Browse the curated ustaz list |
+| `Ctrl+H` | anywhere | Watch history |
+| `Tab` | anywhere | Jump between Search and the current results/groups pane |
+| `↑`/`↓` (or `j`/`k`) | any list | Move selection |
+| `Enter` (or `l`) | Groups | Open the highlighted group |
+| `Enter` (or `l`) | Videos/History | Play the highlighted video |
+| `d` | Videos | Download instead of playing |
+| `[` / `]` | Videos | Cycle quality: best, 1080p, 720p, 480p, 360p, worst, audio-only |
+| `Esc` (or `h`) | any list | Go back |
+| `q` / `Ctrl+C` | anywhere | Quit |
 
-```sh
-talabulilm bakhiet                        # browse: channel/playlist -> video
-talabulilm -u                             # pick an ustaz, then browse their channel(s)
-talabulilm -f "sabar dalam ujian"         # skip grouping, plain video search
-talabulilm -d -q 720 "adab menuntut ilmu" # download at 720p (flat search)
-talabulilm -c                             # continue from history
-```
-
-If no channel matches your query (or with `-f`), it falls back to a plain
-flat video search, same as before.
+If no channel matches your query, it falls back to a plain flat video
+search and drops you straight into the Videos list.
 
 ## Customizing the ustaz list
 
-The first time you run talabulilm, it copies a default list to
+The first time you run talabulilm, it copies its built-in default list to
 `${XDG_DATA_HOME:-$HOME/.local/share}/talabulilm/ustaz_list.txt` — edit
 that copy (one name per line; `#` comments and blank lines are ignored).
-`talabulilm -u` fuzzy-lists these names via `fzf`; picking one runs the
-same browse flow as free-text search, just pre-filled with that name.
+`Ctrl+U` fuzzy-filters these names as you type; picking one runs the same
+browse flow as a free-text search, pre-filled with that name.
 
 ## History
 
-Watched videos are logged to
-`${XDG_STATE_HOME:-$HOME/.local/state}/talabulilm/history.tsv` so
-`talabulilm -c` can bring them back up.
+Watched (or downloaded) videos are logged to
+`${XDG_STATE_HOME:-$HOME/.local/state}/talabulilm/history.json` so
+`Ctrl+H` can bring them back up, most-recent-first.
 
 ## Caching
 
-Building the channel/playlist group listing is the slow part (multiple
-YouTube requests). Results are cached per query under
-`${XDG_DATA_HOME:-$HOME/.local/share}/talabulilm/cache/` for 24 hours, so
-repeating the same search is instant. Pass `-r`/`--refresh` to force a
-re-fetch (e.g. once you know new videos were uploaded). Delete the cache
-directory anytime to clear it entirely.
+Building a query's channel/playlist group listing is the slow part
+(several `yt-dlp` calls). Results are cached per query under
+`${XDG_DATA_HOME:-$HOME/.local/share}/talabulilm/cache/<version>/` for 24
+hours, so repeating the same search is instant. The cache path is
+versioned, so upgrading talabulilm never serves you a stale cache in a
+format the new version doesn't expect.
 
 ## How it works
 
-talabulilm is a single bash script; there's no server or database.
+talabulilm is a Rust TUI (`ratatui` + `crossterm` + `tokio`) — no server,
+no database. It never talks to YouTube directly: `yt-dlp` already solves
+a moving-target problem (signature ciphers, PO tokens, SABR-only
+streaming) that would be a maintenance trap to reimplement, so talabulilm
+just orchestrates it as a subprocess, same as `mpv` for playback.
 
-1. `search_channels` asks YouTube (via `yt-dlp`, filtered to channel results)
+1. `ytdlp::search_channels` asks YouTube (filtered to channel results)
    for channels matching your query, ranked by subscriber count.
-2. `build_groups` fetches each channel's playlists and its uploads feed, then
-   diffs the two so any upload not in a playlist ends up in an "Other videos"
-   bucket. Playlist contents are fetched in parallel (capped at 5 at a time)
-   to keep this reasonably fast.
-3. Two `fzf` prompts (group, then video) drive selection; `mpv` (with
-   `yt-dlp` as its extractor backend) handles playback.
+2. `groups::build_channel_groups` fetches each channel's playlists and
+   its uploads feed concurrently, then diffs the two so any upload not in
+   a playlist ends up in the `OTHER` bucket. Playlist contents fetch with
+   bounded concurrency so a channel with many playlists doesn't open
+   dozens of `yt-dlp` processes at once. Each channel's groups are sent
+   to the UI as soon as they're ready, so results stream in instead of
+   waiting for everything to finish.
+3. `mpv`/`yt-dlp` run as external processes for playback/download; the
+   TUI briefly steps aside (leaves the alternate screen) while they run.
 
 ## Project structure
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| `talabulilm` | The script — everything lives here |
-| `ustaz_list.txt` | Curated names shown by `-u`; edit freely |
-| `README.md` | This file |
-| `LICENSE` | MIT license |
+| `src/main.rs` | Terminal setup, event loop, background task dispatch |
+| `src/app.rs` | Application state machine: views, keybindings, actions |
+| `src/ui.rs` | Rendering |
+| `src/ytdlp.rs` | All `yt-dlp`/`mpv` subprocess orchestration |
+| `src/groups.rs` | Channel → playlist/OTHER grouping logic |
+| `src/cache.rs`, `src/history.rs`, `src/ustaz_list.rs`, `src/paths.rs` | Persistence |
+| `src/text_field.rs` | Reusable text-input widget |
+| `ustaz_list.txt` | Default curated names, embedded into the binary |
 
 ## Notes
 
-- All content is sourced live from YouTube via `yt-dlp`; talabulilm itself
-  hosts nothing.
+- All content is sourced live from YouTube via `yt-dlp`; talabulilm
+  itself hosts nothing.
 - Respect content creators — this tool streams public YouTube videos the
-  same way a browser would, it does not download/rehost anything by default.
+  same way a browser would, it does not download/rehost anything by
+  default.
 
 ## Author
 

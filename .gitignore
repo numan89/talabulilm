@@ -1,3 +1,6 @@
+# Rust build artifacts
+/target
+
 # Downloaded lectures, if downloaded into the repo directory
 *.mp4
 *.mkv
