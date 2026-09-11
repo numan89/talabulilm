@@ -107,6 +107,7 @@ async fn handle_action(
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> Result<()> {
     match action {
+        Action::Quit => app.should_quit = true,
         Action::Play(video) => {
             let title = video.title.clone();
             history::record(&video);
