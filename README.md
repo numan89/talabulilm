@@ -7,11 +7,14 @@ anime it searches, lists, and streams ceramah videos.
 Type a name or topic and it browses in two steps, like a mini video library:
 
 1. **Pick a group** — talabulilm finds matching YouTube channels, and for
-   each one lists its 📁 playlists plus a 🎬 "Other videos" bucket for
-   uploads the channel never put in a playlist. A preview pane shows
-   what's inside before you commit.
+   each one lists its `PL` playlists plus an `OTHER` bucket for uploads
+   the channel never put in a playlist. A preview pane shows what's
+   inside before you commit.
 2. **Pick a video** — from inside the chosen channel/playlist. Press
    `Esc` here to go back to the group list (`Ctrl-C` quits entirely).
+
+Both screens render as a rounded, bordered `fzf` panel with a branded
+label, matching the look of my other terminal tools.
 
 Then it streams straight into `mpv` via `yt-dlp` — no browser, no ads, no
 downloads needed (unless you want one).
@@ -122,6 +125,10 @@ talabulilm is a single bash script; there's no server or database.
   hosts nothing.
 - Respect content creators — this tool streams public YouTube videos the
   same way a browser would, it does not download/rehost anything by default.
+
+## Author
+
+Made by [Muhammad Nu'man](https://github.com/numan89).
 
 ## License
 
