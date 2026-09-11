@@ -9,7 +9,7 @@ license=('MIT')
 depends=('yt-dlp' 'mpv')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/numan89/talabulilm/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('83e7b6cb5c78c78d0c79395067dd30f2bebf5321fa07caca7ed9fac9c1a75c96')
 
 prepare() {
 	cd "$pkgname-$pkgver"
