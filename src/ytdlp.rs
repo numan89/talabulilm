@@ -4,9 +4,17 @@
 //! maintenance trap to duplicate, so we shell out to it exactly like the
 //! bash version did.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Video {
@@ -202,24 +210,115 @@ impl Quality {
     }
 }
 
+/// Where mpv playback ended up, gathered over its JSON IPC socket while it
+/// ran — how far in it got and whether it reached the end on its own —
+/// so the caller can record real watch progress instead of just "played
+/// this at some point".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlaybackOutcome {
+    pub position_secs: Option<f64>,
+    pub duration_secs: Option<f64>,
+    /// True on a clean end-of-file, or (as a fallback, in case mpv is
+    /// killed right at the end before the eof event reaches us) once
+    /// position is within 5% of duration.
+    pub finished: bool,
+}
+
 /// Plays a video URL in `mpv`, blocking until the player exits. Callers on
 /// the TUI side are expected to leave the alternate screen first (mpv
 /// opens its own window via `--force-window=yes`, but sharing a terminal
 /// with a raw-mode TUI underneath it is asking for trouble).
-pub async fn play(url: &str, title: &str, quality: Quality) -> Result<()> {
-    let status = Command::new("mpv")
-        .arg("--force-window=yes")
+///
+/// `resume_from` seeks to that position on start (used for "continue
+/// watching" from History); mpv is given an IPC socket so we can observe
+/// `time-pos`/`duration` as it plays and know where playback actually
+/// left off, regardless of how the user closed the player.
+pub async fn play(url: &str, title: &str, quality: Quality, resume_from: Option<f64>) -> Result<PlaybackOutcome> {
+    let socket_path = std::env::temp_dir().join(format!("talabulilm-mpv-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket_path);
+
+    let mut cmd = Command::new("mpv");
+    cmd.arg("--force-window=yes")
         .arg(format!("--ytdl-format={}", quality.format_string()))
         .arg(format!("--title={title}"))
-        .arg(url)
-        .status()
-        .await
-        .context("failed to run mpv (is it installed?)")?;
+        .arg(format!("--input-ipc-server={}", socket_path.display()));
+    if let Some(start) = resume_from {
+        cmd.arg(format!("--start={start}"));
+    }
+    cmd.arg(url);
+
+    let mut child = cmd.spawn().context("failed to run mpv (is it installed?)")?;
+
+    let state = Arc::new(Mutex::new(PlaybackOutcome::default()));
+    let tracker = tokio::spawn(track_playback(socket_path.clone(), state.clone()));
+
+    let status = child.wait().await.context("failed to wait on mpv")?;
+    tracker.abort();
+    let _ = std::fs::remove_file(&socket_path);
 
     if !status.success() {
         bail!("mpv exited with {status}");
     }
-    Ok(())
+
+    let mut outcome = *state.lock().await;
+    if let (Some(pos), Some(dur)) = (outcome.position_secs, outcome.duration_secs)
+        && dur > 0.0
+        && pos / dur >= 0.95
+    {
+        outcome.finished = true;
+    }
+    Ok(outcome)
+}
+
+/// Connects to mpv's IPC socket (retrying briefly since mpv needs a
+/// moment to create it after spawn) and observes `time-pos`/`duration`
+/// plus the `end-file` event, updating `state` as they arrive. Degrades
+/// silently — playback still works with no progress tracked — if the
+/// socket never shows up (e.g. an mpv build without IPC support).
+async fn track_playback(socket_path: PathBuf, state: Arc<Mutex<PlaybackOutcome>>) {
+    let mut stream = None;
+    for _ in 0..50 {
+        match UnixStream::connect(&socket_path).await {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    let Some(stream) = stream else { return };
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    let _ = write_half.write_all(b"{\"command\":[\"observe_property\",1,\"time-pos\"]}\n").await;
+    let _ = write_half.write_all(b"{\"command\":[\"observe_property\",2,\"duration\"]}\n").await;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        match msg.get("event").and_then(Value::as_str) {
+            Some("property-change") => {
+                let name = msg.get("name").and_then(Value::as_str);
+                let data = msg.get("data").and_then(Value::as_f64);
+                let mut guard = state.lock().await;
+                match name {
+                    // Only overwrite with a real value: mpv sends one
+                    // final property-change with no "data" (null) right
+                    // as playback stops (quit/eof), and blindly applying
+                    // that would wipe out the position we'd already
+                    // tracked during actual playback.
+                    Some("time-pos") if data.is_some() => guard.position_secs = data,
+                    Some("duration") if data.is_some() => guard.duration_secs = data,
+                    _ => {}
+                }
+            }
+            Some("end-file") => {
+                if msg.get("reason").and_then(Value::as_str) == Some("eof") {
+                    state.lock().await.finished = true;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Downloads a video URL via `yt-dlp` into `dir`, blocking until done.

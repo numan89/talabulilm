@@ -1,5 +1,5 @@
 //! Disk cache for a query's group listing. Same semantics as the bash
-//! version: keyed by normalized query text, 24h TTL, and versioned by app
+//! version: keyed by normalized query text, 7-day TTL, and versioned by app
 //! version so a format change auto-invalidates old caches instead of
 //! deserializing something stale into a shape that no longer matches.
 
@@ -8,9 +8,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+use crate::app::SearchLimits;
 use crate::groups::GroupRow;
 
-pub const TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Turns a query into a filesystem-safe directory name: lowercased,
 /// whitespace-collapsed, non-alphanumeric characters replaced. Using the
@@ -29,8 +30,12 @@ fn sanitize_key(query: &str) -> String {
     if key.is_empty() { "_".to_string() } else { key }
 }
 
-pub fn path_for(data_dir: &Path, version: &str, query: &str) -> PathBuf {
-    data_dir.join("cache").join(version).join(sanitize_key(query)).join("groups.json")
+/// Limits are folded into the cache directory (not just the query) so
+/// raising a limit in Settings fetches fresh, larger results instead of
+/// silently reusing a smaller cached listing built under the old limits.
+pub fn path_for(data_dir: &Path, version: &str, query: &str, limits: &SearchLimits) -> PathBuf {
+    let limits_key = format!("c{}p{}u{}", limits.channels, limits.playlists, limits.uploads);
+    data_dir.join("cache").join(version).join(limits_key).join(sanitize_key(query)).join("groups.json")
 }
 
 /// Loads a cached listing if the file exists and is younger than `TTL`.

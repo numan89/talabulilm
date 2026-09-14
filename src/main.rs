@@ -19,14 +19,11 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-use app::{Action, App, AppEvent};
+use app::{Action, App, AppEvent, SearchLimits};
 use ytdlp::{Quality, Video};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SEARCH_COUNT: u32 = 25; // flat-search fallback result count
-const CHANNEL_LIMIT: u32 = 5; // channels considered when grouping
-const PLAYLIST_LIMIT: u32 = 15; // playlists fetched per channel
-const UPLOADS_LIMIT: u32 = 60; // uploads fetched per channel
 const PARALLEL_JOBS: usize = 5; // concurrent yt-dlp calls per channel's playlists
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -108,42 +105,65 @@ async fn handle_action(
 ) -> Result<()> {
     match action {
         Action::Quit => app.should_quit = true,
-        Action::Play(video) => {
+        Action::Play(video, resume_from) => {
             let title = video.title.clone();
-            history::record(&video);
             let quality = app.quality;
-            suspend_for_external(terminal, || play_blocking(video, quality))?;
-            app.status = Some(format!("Finished playing: {title}"));
+            let outcome = suspend_for_external(terminal, || play_blocking(video.clone(), quality, resume_from))?;
+            match outcome {
+                Some(outcome) => {
+                    history::record_watch(&video, outcome);
+                    // Otherwise the History view (if that's where this
+                    // play was launched from) keeps showing the stale
+                    // pre-playback progress until you leave and re-enter
+                    // it, since that's the only other place it reloads
+                    // from disk.
+                    app.refresh_history();
+                    app.status = Some(format!("Finished playing: {title}"));
+                }
+                None => app.status = Some(format!("Playback failed: {title}")),
+            }
         }
         Action::Download(video) => {
             let title = video.title.clone();
-            history::record(&video);
             let quality = app.quality;
-            suspend_for_external(terminal, || download_blocking(video, quality))?;
-            app.status = Some(format!("Downloaded: {title}"));
+            let outcome = suspend_for_external(terminal, || download_blocking(video.clone(), quality))?;
+            if outcome.is_some() {
+                history::record_watch(&video, ytdlp::PlaybackOutcome { position_secs: None, duration_secs: None, finished: true });
+                app.refresh_history();
+                app.status = Some(format!("Downloaded: {title}"));
+            } else {
+                app.status = Some(format!("Download failed: {title}"));
+            }
         }
         other => dispatch(other, tx),
     }
     Ok(())
 }
 
-fn suspend_for_external(terminal: &mut Tui, f: impl FnOnce() -> Result<()>) -> Result<()> {
+/// Gives the terminal back to mpv/yt-dlp for the duration of `f`, then
+/// restores our alternate-screen TUI. `f`'s error (if any) is printed
+/// rather than propagated — a failed play/download shouldn't crash the
+/// whole app — so the caller gets `None` to distinguish that from success.
+fn suspend_for_external<T>(terminal: &mut Tui, f: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
     restore_terminal()?;
     let result = f();
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
     terminal.clear()?;
-    if let Err(e) = result {
-        eprintln!("talabulilm: {e:#}");
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            eprintln!("talabulilm: {e:#}");
+            Ok(None)
+        }
     }
-    Ok(())
 }
 
-fn play_blocking(video: Video, quality: Quality) -> Result<()> {
+fn play_blocking(video: Video, quality: Quality, resume_from: Option<f64>) -> Result<ytdlp::PlaybackOutcome> {
     let rt = tokio::runtime::Handle::current();
     let url = format!("https://www.youtube.com/watch?v={}", video.id);
     println!("Now playing: {}", video.title);
-    tokio::task::block_in_place(|| rt.block_on(ytdlp::play(&url, &video.title, quality)))
+    tokio::task::block_in_place(|| rt.block_on(ytdlp::play(&url, &video.title, quality, resume_from)))
 }
 
 fn download_blocking(video: Video, quality: Quality) -> Result<()> {
@@ -156,10 +176,10 @@ fn download_blocking(video: Video, quality: Quality) -> Result<()> {
 
 fn dispatch(action: Action, tx: &mpsc::UnboundedSender<AppEvent>) {
     match action {
-        Action::None | Action::Play(_) | Action::Download(_) | Action::Quit => {}
-        Action::RunSearch(generation, query) => {
+        Action::None | Action::Play(..) | Action::Download(_) | Action::Quit => {}
+        Action::RunSearch(generation, query, limits) => {
             let tx = tx.clone();
-            tokio::spawn(run_search(generation, query, tx));
+            tokio::spawn(run_search(generation, query, limits, tx));
         }
     }
 }
@@ -168,15 +188,15 @@ fn dispatch(action: Action, tx: &mpsc::UnboundedSender<AppEvent>) {
 /// matching channels and group their playlists (sending progress events
 /// as each channel finishes), falling back to a flat keyword search if no
 /// channel matches at all.
-async fn run_search(generation: u64, query: String, tx: mpsc::UnboundedSender<AppEvent>) {
-    let cache_path = cache::path_for(&paths::data_dir(), VERSION, &query);
+async fn run_search(generation: u64, query: String, limits: SearchLimits, tx: mpsc::UnboundedSender<AppEvent>) {
+    let cache_path = cache::path_for(&paths::data_dir(), VERSION, &query, &limits);
     if let Some(cached) = cache::load(&cache_path) {
         let _ = tx.send(AppEvent::ChannelsFound(generation, 1));
         let _ = tx.send(AppEvent::ChannelGroupsReady(generation, Ok(cached)));
         return;
     }
 
-    let channels = match ytdlp::search_channels(&query, CHANNEL_LIMIT).await {
+    let channels = match ytdlp::search_channels(&query, limits.channels).await {
         Ok(c) if !c.is_empty() => c,
         _ => {
             let res = ytdlp::search_videos(&query, SEARCH_COUNT).await;
@@ -191,7 +211,7 @@ async fn run_search(generation: u64, query: String, tx: mpsc::UnboundedSender<Ap
     for channel in channels {
         let tx = tx.clone();
         handles.push(tokio::spawn(async move {
-            let result = groups::build_channel_groups(channel, UPLOADS_LIMIT, PLAYLIST_LIMIT, PARALLEL_JOBS).await;
+            let result = groups::build_channel_groups(channel, limits.uploads, limits.playlists, PARALLEL_JOBS).await;
             let for_cache = match &result {
                 Ok(rows) => Some(rows.clone()),
                 Err(_) => None,

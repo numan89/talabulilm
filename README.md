@@ -7,19 +7,26 @@ its own persistent UI and keybindings (like
 [`cekhalal`](https://github.com/numan89/cekhalal), my other terminal
 tool — same look, same feel).
 
-Type a name or topic and it browses in two steps, like a mini video
-library:
+Type a name or topic and it browses in a ranger-style flow:
 
-1. **Groups** — talabulilm finds matching YouTube channels, and for each
-   one lists its `PL` playlists plus an `OTHER` bucket for uploads the
-   channel never put in a playlist. Groups stream in live as each channel
-   finishes loading, and a preview pane shows what's inside before you
-   commit — no separate "open" step.
-2. **Videos** — from inside the chosen channel/playlist. `Esc` goes back
-   to the group list.
+1. **Groups** — talabulilm finds matching YouTube channels (up to a
+   configurable limit — see below), and for each one lists its `PL`
+   playlists plus an `OTHER` bucket for uploads the channel never put in
+   a playlist. Groups stream in live as each channel finishes loading.
+   Since a single query can match several channels, Groups is paged by
+   channel (`n`/`p`) — each page shows one channel's playlists.
+2. **Contents** — press `Enter` on a group and control moves straight
+   into its video list (title + duration shown right there, no separate
+   screen) rather than swapping to something else. `/` filters that
+   list incrementally by title.
+
+If no channel matches your query, it falls back to a plain flat video
+search instead.
 
 Then it plays straight into `mpv` via `yt-dlp` — no browser, no ads, no
-downloads needed (unless you want one).
+downloads needed (unless you want one). Playback position is tracked via
+mpv's IPC socket, so anything you didn't finish shows up resumable in
+History.
 
 ## Dependencies
 
@@ -58,19 +65,29 @@ talabulilm bakhiet    # launch and immediately search
 | Keys | Where | Does |
 |---|---|---|
 | Type, `Enter` | Search | Run a search |
+| `Esc` | Search | Clear the box; on an already-empty box, quit |
+| `Alt+←`/`Alt+→`, `Alt+Backspace`, `Ctrl+W`, `Home`/`End` | Search | Word-jump, word-delete, clear-all, line start/end |
+| `/` | anywhere else | Jump back to Search |
 | `Ctrl+U` | anywhere | Browse the curated ustaz list |
 | `Ctrl+H` | anywhere | Watch history |
 | `Tab` | anywhere | Jump between Search and the current results/groups pane |
+| `Alt+1`/`2`/`3` | anywhere | Jump to the Channels/Playlists/Uploads search limits |
 | `↑`/`↓` (or `j`/`k`) | any list | Move selection |
-| `Enter` (or `l`) | Groups | Open the highlighted group |
-| `Enter` (or `l`) | Videos/History | Play the highlighted video |
-| `d` | Videos | Download instead of playing |
-| `[` / `]` | Videos | Cycle quality: best, 1080p, 720p, 480p, 360p, worst, audio-only |
+| `n`/`p` (or PageDown/PageUp) | Groups | Next/previous channel page |
+| `Enter` (or `l`) | Groups | Open the highlighted group → Contents |
+| `Enter` (or `l`) | Contents/Videos/History | Play the highlighted video (resumes if History tracked a position) |
+| `d` | Contents/Videos | Download instead of playing |
+| `[` / `]` | Contents/Videos | Cycle quality: best, 1080p, 720p, 480p, 360p, worst, audio-only |
+| `f` | History | Mark the highlighted entry finished |
+| `x` | History | Delete the highlighted entry |
 | `Esc` (or `h`) | any list | Go back |
 | `q` / `Ctrl+C` | anywhere | Quit |
 
-If no channel matches your query, it falls back to a plain flat video
-search and drops you straight into the Videos list.
+Search limits (Alt+1/2/3): `←`/`→` changes the value, `Enter` reruns the
+search under it, `Tab`/`Esc` backs out without searching.
+
+Videos you've watched to the end (or downloaded) drop out of future
+search results — they're still reachable, and resumable, from `Ctrl+H`.
 
 ## Customizing the ustaz list
 
@@ -84,16 +101,23 @@ browse flow as a free-text search, pre-filled with that name.
 
 Watched (or downloaded) videos are logged to
 `${XDG_STATE_HOME:-$HOME/.local/state}/talabulilm/history.json` so
-`Ctrl+H` can bring them back up, most-recent-first.
+`Ctrl+H` can bring them back up, most-recent-first, along with how far
+into each one you got. Playback position is tracked live over mpv's IPC
+socket, so `Enter` on a partially-watched entry resumes from where you
+left off instead of starting over; `f` force-marks an entry finished and
+`x` deletes it.
 
 ## Caching
 
 Building a query's channel/playlist group listing is the slow part
 (several `yt-dlp` calls). Results are cached per query under
-`${XDG_DATA_HOME:-$HOME/.local/share}/talabulilm/cache/<version>/` for 24
-hours, so repeating the same search is instant. The cache path is
-versioned, so upgrading talabulilm never serves you a stale cache in a
-format the new version doesn't expect.
+`${XDG_DATA_HOME:-$HOME/.local/share}/talabulilm/cache/<version>/` for 7
+days, so repeating the same search is instant. The cache key also
+includes the current Channels/Playlists/Uploads search limits, so
+changing them fetches fresh (larger or smaller) results instead of
+reusing a mismatched cache; the version segment means upgrading
+talabulilm never serves a stale cache in a format the new version
+doesn't expect.
 
 ## How it works
 
@@ -104,16 +128,20 @@ streaming) that would be a maintenance trap to reimplement, so talabulilm
 just orchestrates it as a subprocess, same as `mpv` for playback.
 
 1. `ytdlp::search_channels` asks YouTube (filtered to channel results)
-   for channels matching your query, ranked by subscriber count.
-2. `groups::build_channel_groups` fetches each channel's playlists and
-   its uploads feed concurrently, then diffs the two so any upload not in
-   a playlist ends up in the `OTHER` bucket. Playlist contents fetch with
+   for channels matching your query, ranked by subscriber count, capped
+   at the Channels limit (default 5, adjustable with Alt+1).
+2. `groups::build_channel_groups` fetches each channel's playlists (up to
+   the Playlists limit, Alt+2) and its uploads feed (up to the Uploads
+   limit, Alt+3) concurrently, then diffs the two so any upload not in a
+   playlist ends up in the `OTHER` bucket. Playlist contents fetch with
    bounded concurrency so a channel with many playlists doesn't open
    dozens of `yt-dlp` processes at once. Each channel's groups are sent
    to the UI as soon as they're ready, so results stream in instead of
    waiting for everything to finish.
 3. `mpv`/`yt-dlp` run as external processes for playback/download; the
    TUI briefly steps aside (leaves the alternate screen) while they run.
+   `mpv` is launched with its own IPC socket so talabulilm can observe
+   `time-pos`/`duration` live and record how far you actually got.
 
 ## Project structure
 
