@@ -11,7 +11,7 @@ mod ytdlp;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -44,6 +44,25 @@ fn restore_terminal() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Hidden entry point for `-t`'s "close the terminal, keep playing"
+    // flow: spawned detached (setsid, no controlling terminal - see
+    // `spawn_play_background` below) by the interactive TUI right before
+    // it quits, so this runs on as its own independent process and is
+    // still around to record history once mpv actually exits.
+    if args.first().map(String::as_str) == Some("--play-bg") {
+        let id = args.get(1).cloned().unwrap_or_default();
+        let title = args.get(2).cloned().unwrap_or_default();
+        let channel = args.get(3).cloned().unwrap_or_default();
+        let resume_from = args.get(4).and_then(|s| s.parse::<f64>().ok());
+        let video = Video { id: id.clone(), title: title.clone(), channel, duration: String::new() };
+        match ytdlp::play_audio_background(&id, &title, resume_from).await {
+            Ok(outcome) => history::record_watch(&video, outcome),
+            Err(e) => eprintln!("talabulilm --play-bg: {e:#}"),
+        }
+        return Ok(());
+    }
+
     let terminal_video = args.iter().any(|a| a == "--terminal-video" || a == "-t");
     let initial_query = args
         .into_iter()
@@ -113,22 +132,34 @@ async fn handle_action(
     match action {
         Action::Quit => app.should_quit = true,
         Action::Play(video, resume_from) => {
-            let title = video.title.clone();
-            let quality = app.quality;
-            let terminal_video = app.terminal_video;
-            let outcome = suspend_for_external(terminal, || play_blocking(video.clone(), quality, resume_from, terminal_video))?;
-            match outcome {
-                Some(outcome) => {
-                    history::record_watch(&video, outcome);
-                    // Otherwise the History view (if that's where this
-                    // play was launched from) keeps showing the stale
-                    // pre-playback progress until you leave and re-enter
-                    // it, since that's the only other place it reloads
-                    // from disk.
-                    app.refresh_history();
-                    app.status = Some(format!("Finished playing: {title}"));
+            if app.terminal_video {
+                // -t's "pick something, close the terminal" flow: hand
+                // playback to a detached background process (see
+                // `--play-bg` above) instead of taking over the
+                // terminal ourselves, then quit outright so the kitty
+                // window this was launched in closes on its own -
+                // there's no foreground playback left to wait for or
+                // history to record here, the detached process does
+                // both once mpv actually exits.
+                spawn_play_background(&video, resume_from)?;
+                app.should_quit = true;
+            } else {
+                let title = video.title.clone();
+                let quality = app.quality;
+                let outcome = suspend_for_external(terminal, || play_blocking(video.clone(), quality, resume_from))?;
+                match outcome {
+                    Some(outcome) => {
+                        history::record_watch(&video, outcome);
+                        // Otherwise the History view (if that's where this
+                        // play was launched from) keeps showing the stale
+                        // pre-playback progress until you leave and re-enter
+                        // it, since that's the only other place it reloads
+                        // from disk.
+                        app.refresh_history();
+                        app.status = Some(format!("Finished playing: {title}"));
+                    }
+                    None => app.status = Some(format!("Playback failed: {title}")),
                 }
-                None => app.status = Some(format!("Playback failed: {title}")),
             }
         }
         Action::Download(video) => {
@@ -167,11 +198,28 @@ fn suspend_for_external<T>(terminal: &mut Tui, f: impl FnOnce() -> Result<T>) ->
     }
 }
 
-fn play_blocking(video: Video, quality: Quality, resume_from: Option<f64>, terminal_video: bool) -> Result<ytdlp::PlaybackOutcome> {
+fn play_blocking(video: Video, quality: Quality, resume_from: Option<f64>) -> Result<ytdlp::PlaybackOutcome> {
     let rt = tokio::runtime::Handle::current();
     let url = format!("https://www.youtube.com/watch?v={}", video.id);
     println!("Now playing: {}", video.title);
-    tokio::task::block_in_place(|| rt.block_on(ytdlp::play(&url, &video.title, quality, resume_from, terminal_video)))
+    tokio::task::block_in_place(|| rt.block_on(ytdlp::play(&url, &video.title, quality, resume_from)))
+}
+
+/// Hands `video` off to a `--play-bg` child (see the top of `main` above)
+/// fully detached from this process and its terminal: `setsid` puts it in
+/// its own session so closing the terminal window (which would otherwise
+/// SIGHUP the whole process group) can't touch it, and the null stdio
+/// means it needs nothing back from us once spawned.
+fn spawn_play_background(video: &Video, resume_from: Option<f64>) -> Result<()> {
+    let exe = std::env::current_exe().context("failed to resolve talabulilm's own path")?;
+    let mut cmd = std::process::Command::new("setsid");
+    cmd.arg(exe).arg("--play-bg").arg(&video.id).arg(&video.title).arg(&video.channel);
+    if let Some(pos) = resume_from {
+        cmd.arg(pos.to_string());
+    }
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.spawn().context("failed to detach background playback (is `setsid` installed?)")?;
+    Ok(())
 }
 
 fn download_blocking(video: Video, quality: Quality) -> Result<()> {

@@ -98,10 +98,13 @@ pub struct App {
     pub view: View,
     pub content_pane: ContentPane,
     pub quality: Quality,
-    /// Set once at startup from `--terminal-video`/`-t`; plays video as
-    /// truecolor blocks inside this terminal instead of opening mpv's own
-    /// window. Default stays the real window — this is an opt-in
-    /// alternative, not a replacement.
+    /// Set once at startup from `--terminal-video`/`-t`: selecting
+    /// something to play hands it off to a detached, audio-only
+    /// background process (see `spawn_play_background` in `main.rs`) and
+    /// quits immediately instead of taking over the terminal, so the
+    /// window this was launched in just closes while playback continues.
+    /// Default stays the normal foreground/windowed `play` — this is an
+    /// opt-in alternative, not a replacement.
     pub terminal_video: bool,
     pub limits: SearchLimits,
     /// Which of the three limit boxes (Channels/Playlists/Uploads) has

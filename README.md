@@ -58,18 +58,19 @@ cargo build --release
 ```sh
 talabulilm                     # launch with an empty search box
 talabulilm bakhiet              # launch and immediately search
-talabulilm --terminal-video     # play video as truecolor blocks in this terminal, no mpv window
+talabulilm --terminal-video     # picking something to play closes this terminal, audio keeps going in the background
 talabulilm -t bakhiet           # combine with an initial search
 ```
 
-By default, playing a video opens it in mpv's own window. `--terminal-video`
-(short: `-t`) is an alternative for terminal-only setups (SSH, no display
-server): mpv renders a small video box in the top-left corner of the
-terminal itself, instead of opening a window. It's much lower fidelity than
-a real window, so it stays opt-in rather than the default, and quality is
-capped at 480p regardless of the selected quality — a small terminal box
-can't show more detail than that anyway, so fetching more would only cost
-data.
+By default, playing a video opens it in mpv's own window and talabulilm
+stays open in the terminal underneath. `--terminal-video` (short: `-t`) is
+for launching talabulilm as a quick, throwaway popup terminal: as soon as
+you pick something to play, the window this was launched in closes and
+mpv keeps playing audio-only in the background, detached from any
+terminal. It shares its playback socket and status file with the SUPER+P
+`ilmuakhirat` quick-resume shortcut, so the same waybar controls (play/
+pause) work on it either way, and it's tracked in History like any other
+watch.
 
 ### Keybindings
 

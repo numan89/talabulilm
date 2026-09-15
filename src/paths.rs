@@ -24,3 +24,17 @@ pub fn state_dir() -> PathBuf {
 pub fn history_file() -> PathBuf {
     state_dir().join("history.json")
 }
+
+/// Shared with gem-say.sh's SUPER+P "ilmuakhirat" row and the waybar
+/// ilmuakhirat-*.sh scripts: `-t`'s background audio playback (see
+/// `ytdlp::play_audio_background`) writes to these same files so the
+/// existing waybar module can show/control that session too, and so only
+/// one such session is ever "now playing" regardless of which side
+/// started it.
+pub fn ilmuakhirat_sock() -> PathBuf {
+    home_dir().join(".cache/gem-say/ilmuakhirat.sock")
+}
+
+pub fn ilmuakhirat_playing_file() -> PathBuf {
+    home_dir().join(".cache/gem-say/ilmuakhirat_playing.json")
+}
