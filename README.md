@@ -70,7 +70,10 @@ mpv keeps playing audio-only in the background, detached from any
 terminal. It shares its playback socket and status file with the SUPER+P
 `ilmuakhirat` quick-resume shortcut, so the same waybar controls (play/
 pause) work on it either way, and it's tracked in History like any other
-watch.
+watch. Whichever side starts playback stops any session already running
+on that shared socket first (refusing to start rather than racing it if
+the old one won't quit), so there's only ever one background session at
+a time and it's always the one waybar is showing.
 
 ### Keybindings
 

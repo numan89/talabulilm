@@ -288,6 +288,17 @@ pub async fn play_audio_background(id: &str, title: &str, resume_from: Option<f6
     if let Some(dir) = sock.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    // The socket path is shared with gem-say.sh's own resume-launched mpv
+    // (see the doc comment above), so a stale/live socket here doesn't
+    // necessarily mean a dead leftover - it can be a still-running mpv
+    // from the other side. Deleting the file out from under it would just
+    // orphan that process (untracked, unkillable from waybar) while a
+    // second mpv starts playing over it. Stop whatever's actually there
+    // first so there's ever only one "now playing" session - and if it
+    // won't stop, refuse to bind over it rather than racing it.
+    if sock.exists() && !stop_existing_ilmuakhirat_session(&sock).await {
+        bail!("an existing ilmuakhirat session is still playing and didn't respond to quit");
+    }
     let _ = std::fs::remove_file(&sock);
     let _ = std::fs::remove_file(&playing_file);
 
@@ -325,8 +336,16 @@ pub async fn play_audio_background(id: &str, title: &str, resume_from: Option<f6
     let status = child.wait().await.context("failed to wait on mpv")?;
     tracker.abort();
 
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_file(&playing_file);
+    // Only clear the shared files if they still describe *this* session.
+    // The start-side check above stops a still-running old session before
+    // binding, but if a *newer* session started after ours somehow (e.g.
+    // this process got signalled and is only now reaching this line),
+    // blindly deleting here would rip away its live tracking instead of
+    // ours - same reasoning as gem-say.sh's mirror of this cleanup.
+    if playing_file_belongs_to(&playing_file, title) {
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&playing_file);
+    }
     let _ = std::process::Command::new("pkill").args(["-RTMIN+22", "waybar"]).status();
 
     if !status.success() {
@@ -341,6 +360,34 @@ pub async fn play_audio_background(id: &str, title: &str, resume_from: Option<f6
         outcome.finished = true;
     }
     Ok(outcome)
+}
+
+/// True if `playing_file` is missing/unparseable (nothing to protect) or
+/// its `title` field still matches `title` (still ours to clean up).
+fn playing_file_belongs_to(playing_file: &std::path::Path, title: &str) -> bool {
+    let Ok(contents) = std::fs::read_to_string(playing_file) else { return true };
+    let Ok(value) = serde_json::from_str::<Value>(&contents) else { return true };
+    value.get("title").and_then(Value::as_str).map(|t| t == title).unwrap_or(true)
+}
+
+/// Quits whatever mpv currently owns the shared ilmuakhirat IPC socket, if
+/// any, and waits for it to actually exit (mpv unlinks its own socket
+/// file on the way out) before returning - so callers about to bind a new
+/// mpv to the same path never race a still-live one. Returns whether the
+/// path is now clear; a caller must NOT proceed to bind over the socket
+/// (or delete it) when this returns `false`, since that mpv is still
+/// alive and would just be orphaned, untracked, in the background.
+async fn stop_existing_ilmuakhirat_session(sock: &PathBuf) -> bool {
+    if let Ok(mut stream) = UnixStream::connect(sock).await {
+        let _ = stream.write_all(b"{\"command\":[\"quit\"]}\n").await;
+    }
+    for _ in 0..30 {
+        if !sock.exists() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
 }
 
 /// Connects to mpv's IPC socket (retrying briefly since mpv needs a
