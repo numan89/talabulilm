@@ -98,6 +98,11 @@ pub struct App {
     pub view: View,
     pub content_pane: ContentPane,
     pub quality: Quality,
+    /// Set once at startup from `--terminal-video`/`-t`; plays video as
+    /// truecolor blocks inside this terminal instead of opening mpv's own
+    /// window. Default stays the real window — this is an opt-in
+    /// alternative, not a replacement.
+    pub terminal_video: bool,
     pub limits: SearchLimits,
     /// Which of the three limit boxes (Channels/Playlists/Uploads) has
     /// focus, if any — `None` means the search row is either on the
@@ -173,6 +178,7 @@ impl App {
             view: View::Search,
             content_pane: ContentPane::Results,
             quality: Quality::Best,
+            terminal_video: false,
             limits: SearchLimits::default(),
             limits_focus: None,
             results: Vec::new(),

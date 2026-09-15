@@ -1,6 +1,6 @@
 [package]
 name = "talabulilm"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Watch Ceramah Ustaz (Islamic lectures) from the terminal"
 license = "MIT"

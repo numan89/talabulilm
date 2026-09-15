@@ -56,9 +56,20 @@ cargo build --release
 ## Usage
 
 ```sh
-talabulilm            # launch with an empty search box
-talabulilm bakhiet    # launch and immediately search
+talabulilm                     # launch with an empty search box
+talabulilm bakhiet              # launch and immediately search
+talabulilm --terminal-video     # play video as truecolor blocks in this terminal, no mpv window
+talabulilm -t bakhiet           # combine with an initial search
 ```
+
+By default, playing a video opens it in mpv's own window. `--terminal-video`
+(short: `-t`) is an alternative for terminal-only setups (SSH, no display
+server): mpv renders a small video box in the top-left corner of the
+terminal itself, instead of opening a window. It's much lower fidelity than
+a real window, so it stays opt-in rather than the default, and quality is
+capped at 480p regardless of the selected quality — a small terminal box
+can't show more detail than that anyway, so fetching more would only cost
+data.
 
 ### Keybindings
 

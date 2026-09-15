@@ -197,6 +197,17 @@ impl Quality {
         }
     }
 
+    /// Caps to at most 480p for `--terminal-video`: a terminal-graphics
+    /// box is far smaller than a real window, so fetching `Best`/1080p
+    /// buys no visible detail there, only data. Leaves an already-lower
+    /// explicit choice (480p, 360p, Worst, audio) alone.
+    fn capped_for_terminal_video(self) -> Quality {
+        match self {
+            Quality::Best | Quality::P1080 | Quality::P720 => Quality::P480,
+            other => other,
+        }
+    }
+
     pub fn cycle_next(self) -> Self {
         match self {
             Quality::Best => Quality::P1080,
@@ -233,13 +244,45 @@ pub struct PlaybackOutcome {
 /// watching" from History); mpv is given an IPC socket so we can observe
 /// `time-pos`/`duration` as it plays and know where playback actually
 /// left off, regardless of how the user closed the player.
-pub async fn play(url: &str, title: &str, quality: Quality, resume_from: Option<f64>) -> Result<PlaybackOutcome> {
+///
+/// `terminal_video` swaps the separate mpv window for mpv's own `tct`
+/// video output, which draws the frame as truecolor blocks straight into
+/// the terminal we just gave mpv back — opt-in only (started via
+/// `--terminal-video`) since it's much lower fidelity than a real window.
+/// Sized small and pinned to the top-left (mpv always starts drawing at
+/// the current cursor position, the terminal's top-left right after its
+/// alternate-screen switch) rather than stretched to fill whatever
+/// terminal it happens to run in. No info overlay: every way tried to
+/// show one (mpv's OSD — not composited at all by `tct`; `drawtext` baked
+/// into the frame — illegible at a small box's resolution; Kitty
+/// graphics with the screen kept — worked, but only on Kitty-protocol
+/// terminals and added real fragility for a "little info" ask) cost more
+/// than it was worth. Keeping this the plain, boring version.
+pub async fn play(url: &str, title: &str, quality: Quality, resume_from: Option<f64>, terminal_video: bool) -> Result<PlaybackOutcome> {
     let socket_path = std::env::temp_dir().join(format!("talabulilm-mpv-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket_path);
 
+    // A small terminal box is far smaller than a real window, so
+    // fetching Best/1080p buys no visible detail there, only data —
+    // capped down unless the caller already picked something lower.
+    let effective_quality = if terminal_video { quality.capped_for_terminal_video() } else { quality };
+
     let mut cmd = Command::new("mpv");
-    cmd.arg("--force-window=yes")
-        .arg(format!("--ytdl-format={}", quality.format_string()))
+    if terminal_video {
+        let (cols, rows) = terminal_video_box_size();
+        cmd.arg("--vo=tct")
+            // mpv's normal console status line ("AV: 00:00:05 / 00:03:33
+            // (2%)") writes straight to the terminal too, fighting
+            // `tct`'s own frame-drawing escape codes over the same
+            // cursor, causing visible flicker. `--quiet` turns it off;
+            // playback progress still comes from the IPC socket below.
+            .arg("--quiet")
+            .arg(format!("--vo-tct-width={cols}"))
+            .arg(format!("--vo-tct-height={rows}"));
+    } else {
+        cmd.arg("--force-window=yes");
+    }
+    cmd.arg(format!("--ytdl-format={}", effective_quality.format_string()))
         .arg(format!("--title={title}"))
         .arg(format!("--input-ipc-server={}", socket_path.display()));
     if let Some(start) = resume_from {
@@ -268,6 +311,19 @@ pub async fn play(url: &str, title: &str, quality: Quality, resume_from: Option<
         outcome.finished = true;
     }
     Ok(outcome)
+}
+
+/// Size of the `tct` box for `--terminal-video`: a fixed small size,
+/// clamped to the real terminal so it still fits in a small window.
+fn terminal_video_box_size() -> (u16, u16) {
+    const DEFAULT_COLS: u16 = 64;
+    const DEFAULT_ROWS: u16 = 20;
+    const MIN_COLS: u16 = 20;
+    const MIN_ROWS: u16 = 8;
+    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let cols = DEFAULT_COLS.min(term_cols).max(MIN_COLS.min(term_cols));
+    let rows = DEFAULT_ROWS.min(term_rows).max(MIN_ROWS.min(term_rows));
+    (cols, rows)
 }
 
 /// Connects to mpv's IPC socket (retrying briefly since mpv needs a

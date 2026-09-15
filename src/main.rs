@@ -43,11 +43,18 @@ fn restore_terminal() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let initial_query = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let terminal_video = args.iter().any(|a| a == "--terminal-video" || a == "-t");
+    let initial_query = args
+        .into_iter()
+        .filter(|a| a != "--terminal-video" && a != "-t")
+        .collect::<Vec<_>>()
+        .join(" ");
 
     let mut terminal = init_terminal()?;
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new();
+    app.terminal_video = terminal_video;
 
     if !initial_query.trim().is_empty() {
         let action = app.seed_query(&initial_query);
@@ -108,7 +115,8 @@ async fn handle_action(
         Action::Play(video, resume_from) => {
             let title = video.title.clone();
             let quality = app.quality;
-            let outcome = suspend_for_external(terminal, || play_blocking(video.clone(), quality, resume_from))?;
+            let terminal_video = app.terminal_video;
+            let outcome = suspend_for_external(terminal, || play_blocking(video.clone(), quality, resume_from, terminal_video))?;
             match outcome {
                 Some(outcome) => {
                     history::record_watch(&video, outcome);
@@ -159,11 +167,11 @@ fn suspend_for_external<T>(terminal: &mut Tui, f: impl FnOnce() -> Result<T>) ->
     }
 }
 
-fn play_blocking(video: Video, quality: Quality, resume_from: Option<f64>) -> Result<ytdlp::PlaybackOutcome> {
+fn play_blocking(video: Video, quality: Quality, resume_from: Option<f64>, terminal_video: bool) -> Result<ytdlp::PlaybackOutcome> {
     let rt = tokio::runtime::Handle::current();
     let url = format!("https://www.youtube.com/watch?v={}", video.id);
     println!("Now playing: {}", video.title);
-    tokio::task::block_in_place(|| rt.block_on(ytdlp::play(&url, &video.title, quality, resume_from)))
+    tokio::task::block_in_place(|| rt.block_on(ytdlp::play(&url, &video.title, quality, resume_from, terminal_video)))
 }
 
 fn download_blocking(video: Video, quality: Quality) -> Result<()> {
